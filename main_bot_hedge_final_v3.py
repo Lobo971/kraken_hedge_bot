@@ -1,157 +1,161 @@
 import krakenex
-import pandas as pd
 import time
 import requests
 from datetime import datetime
-import threading
+from telebot import TeleBot, types
 
 # ==============================
-# CONFIGURAÇÕES
+# CONFIGURAÇÕES TELEGRAM
 # ==============================
 TELEGRAM_TOKEN = "8335062260:AAGsIUyqS0i0zWGnBS6Z1CFSCqofMNMJLjQ"
 CHAT_ID = "8288457417"
 
-PAR = "ETH/EUR"
-TIMEFRAME = 60 # 1 minuto
-EMA_CURTA = 9
-EMA_LONGA = 21
+bot = TeleBot(TELEGRAM_TOKEN)
 
-RISCO_POR_TRADE = 0.01 # 1%
-STOP_LOSS_PCT = 0.015 # 1.5%
-CHECK_INTERVAL = 60
-
-# ==============================
-# TELEGRAM
-# ==============================
-def enviar_telegram(msg):
+def enviar_telegram(msg, chat_id=CHAT_ID):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+    try:
+        requests.post(url, data={"chat_id": chat_id, "text": msg}, timeout=10)
+        print(f"[TELEGRAM] {msg}")
+    except Exception as e:
+        print(f"[TELEGRAM] Erro ao enviar mensagem: {e}")
 
 # ==============================
-# KRAKEN
+# CONFIGURAÇÕES KRAKEN
 # ==============================
 api = krakenex.API()
-api.load_key('kraken.key')
+api.load_key('kraken.key')  # arquivo com API_KEY e SECRET
 
 # ==============================
-# DADOS DE MERCADO
+# CONFIGURAÇÃO DE ESTRATÉGIA
 # ==============================
-def obter_ohlc():
-    resp = api.query_public("OHLC", {
-        "pair": PAR.replace("/", ""),
-        "interval": TIMEFRAME
-    })
-    data = resp["result"][list(resp["result"].keys())[0]]
-    df = pd.DataFrame(data, columns=[
-        "time","open","high","low","close","vwap","volume","count"
-    ])
-    df["close"] = df["close"].astype(float)
-    return df
+SALDO_MINIMO = 15
+QUANTIDADE = {"BTC/EUR": 0.001, "ETH/EUR": 0.01}
+STOP_LOSS = 0.95       # 5% abaixo do preço de compra
+TAKE_PROFIT = 1.05     # 5% acima do preço de compra
+CHECK_INTERVAL = 60
+PARS_OPERACAO = ["BTC/EUR", "ETH/EUR"]
 
-def calcular_emas(df):
-    df["ema_curta"] = df["close"].ewm(span=EMA_CURTA).mean()
-    df["ema_longa"] = df["close"].ewm(span=EMA_LONGA).mean()
-    return df
+# Armazena trades abertos
+trades_abertos = {}
 
 # ==============================
-# SALDO
+# FUNÇÕES
 # ==============================
 def saldo_eur():
-    resp = api.query_private("Balance")
-    return float(resp["result"].get("ZEUR", 0))
+    try:
+        resp = api.query_private('Balance')
+        if resp.get('error'):
+            enviar_telegram(f"⚠️ Erro na API Kraken: {resp['error']}")
+            return 0
+        return float(resp['result'].get('ZEUR', 0))
+    except Exception as e:
+        enviar_telegram("⚠️ Erro ao consultar saldo na Kraken.")
+        return 0
+
+def registrar_saldo(chat_id=CHAT_ID):
+    saldo = saldo_eur()
+    enviar_telegram(f"💰 Saldo atual: {saldo:.2f}€", chat_id)
+    return saldo
+
+def consultar_preco(par):
+    try:
+        resp = api.query_public('Ticker', {"pair": par.replace("/", "")})
+        preco = float(resp['result'][par.replace("/", "")]['c'][0])
+        return preco
+    except Exception as e:
+        enviar_telegram(f"⚠️ Erro ao consultar preço {par}: {e}")
+        return 0
+
+def executar_trade(par, tipo, quantidade, chat_id=CHAT_ID):
+    try:
+        resp = api.query_private('AddOrder', {
+            "pair": par.replace("/", ""),
+            "type": tipo.lower(),
+            "ordertype": "market",
+            "volume": str(quantidade)
+        })
+        if resp.get('error'):
+            enviar_telegram(f"⚠️ Erro ao executar trade {par}: {resp['error']}", chat_id)
+            return None
+        txid = list(resp['result']['txid'])[0]
+        info = api.query_private('QueryOrders', {"txid": txid})
+        preco_executado = float(info['result'][txid]['price'])
+        registrar_trade(par, tipo, quantidade, preco_executado, chat_id)
+        return preco_executado
+    except Exception as e:
+        enviar_telegram(f"⚠️ Erro inesperado trade {par}: {e}", chat_id)
+        return None
+
+def registrar_trade(par, tipo, quantidade, preco, chat_id=CHAT_ID):
+    msg = (f"💹 TRADE EXECUTADO\nPar: {par}\nTipo: {tipo}\nQuantidade: {quantidade}\n"
+           f"Preço: {preco:.2f}")
+    enviar_telegram(msg, chat_id)
+    with open("log_trades.txt", "a") as f:
+        f.write(f"{datetime.now()} | {msg}\n")
+
+def verificar_venda(par):
+    if par not in trades_abertos:
+        return
+    preco_compra, quantidade = trades_abertos[par]
+    preco_atual = consultar_preco(par)
+    if preco_atual == 0:
+        return
+    # Take profit
+    if preco_atual >= preco_compra * TAKE_PROFIT:
+        executar_trade(par, "SELL", quantidade)
+        enviar_telegram(f"💰 Trade vendido com lucro! Par: {par}, Preço: {preco_atual:.2f}")
+        del trades_abertos[par]
+    # Stop loss
+    elif preco_atual <= preco_compra * STOP_LOSS:
+        executar_trade(par, "SELL", quantidade)
+        enviar_telegram(f"⚠️ Trade vendido no stop-loss. Par: {par}, Preço: {preco_atual:.2f}")
+        del trades_abertos[par]
 
 # ==============================
-# EXECUÇÃO DE ORDENS
+# COMANDOS TELEGRAM
 # ==============================
-def comprar(volume):
-    api.query_private("AddOrder", {
-        "pair": PAR.replace("/", ""),
-        "type": "buy",
-        "ordertype": "market",
-        "volume": volume
-    })
+@bot.message_handler(commands=['start'])
+def cmd_start(message: types.Message):
+    bot.reply_to(message, "🚀 BOT ULTRAPROFISSIONAL LIGADO!\nSistema conectado à Kraken.")
+    saldo = registrar_saldo(message.chat.id)
+    bot.send_message(message.chat.id, f"💰 Saldo inicial registrado: {saldo:.2f}€")
 
-def vender(volume):
-    api.query_private("AddOrder", {
-        "pair": PAR.replace("/", ""),
-        "type": "sell",
-        "ordertype": "market",
-        "volume": volume
-    })
+@bot.message_handler(commands=['saldo'])
+def cmd_saldo(message: types.Message):
+    saldo = saldo_eur()
+    bot.reply_to(message, f"💰 Saldo atual: {saldo:.2f}€")
 
-# ==============================
-# ESTADO DO BOT
-# ==============================
-em_posicao = False
-preco_entrada = 0
-volume_atual = 0
+# Echo genérico
+@bot.message_handler(func=lambda m: True)
+def echo(message: types.Message):
+    bot.reply_to(message, f"Comando recebido: {message.text}")
 
 # ==============================
-# LOOP PRINCIPAL
+# LOOP PRINCIPAL 24/7
 # ==============================
-def loop():
-    global em_posicao, preco_entrada, volume_atual
-
-    enviar_telegram("🤖 Bot profissional iniciado")
-
+def loop_principal():
     while True:
-        try:
-            df = obter_ohlc()
-            df = calcular_emas(df)
-
-            atual = df.iloc[-1]
-            anterior = df.iloc[-2]
-
-            saldo = saldo_eur()
-
-            # ===== ENTRADA =====
-            if not em_posicao:
-                cruzamento_alta = (
-                    anterior["ema_curta"] < anterior["ema_longa"] and
-                    atual["ema_curta"] > atual["ema_longa"]
-                )
-
-                if cruzamento_alta and saldo > 20:
-                    risco_valor = saldo * RISCO_POR_TRADE
-                    volume = round((risco_valor / atual["close"]), 6)
-
-                    comprar(volume)
-
-                    em_posicao = True
-                    preco_entrada = atual["close"]
-                    volume_atual = volume
-
-                    enviar_telegram(
-                        f"🟢 COMPRA EXECUTADA\nPreço: {preco_entrada:.2f}€\nVolume: {volume}"
-                    )
-
-            # ===== SAÍDA =====
-            else:
-                stop_loss = preco_entrada * (1 - STOP_LOSS_PCT)
-                cruzamento_baixa = atual["ema_curta"] < atual["ema_longa"]
-
-                if atual["close"] <= stop_loss or cruzamento_baixa:
-                    vender(volume_atual)
-
-                    lucro = (atual["close"] - preco_entrada) * volume_atual
-
-                    enviar_telegram(
-                        f"🔴 VENDA EXECUTADA\nPreço: {atual['close']:.2f}€\nLucro: {lucro:.2f}€"
-                    )
-
-                    em_posicao = False
-                    preco_entrada = 0
-                    volume_atual = 0
-
-        except Exception as e:
-            enviar_telegram(f"⚠️ Erro no bot: {e}")
-
+        saldo = saldo_eur()
+        if saldo < SALDO_MINIMO:
+            enviar_telegram(f"⚠️ Saldo insuficiente para operar.\nSaldo atual: {saldo:.2f}€")
+            time.sleep(CHECK_INTERVAL)
+            continue
+        enviar_telegram(f"🔥 Saldo suficiente para operar! Saldo: {saldo:.2f}€")
+        for par in PARS_OPERACAO:
+            # Se já tiver trade aberto, só verifica venda
+            if par in trades_abertos:
+                verificar_venda(par)
+                continue
+            quantidade = QUANTIDADE[par]
+            preco_executado = executar_trade(par, "BUY", quantidade)
+            if preco_executado:
+                trades_abertos[par] = (preco_executado, quantidade)
         time.sleep(CHECK_INTERVAL)
 
 # ==============================
-# START
+# EXECUÇÃO
 # ==============================
-threading.Thread(target=loop, daemon=True).start()
-
-while True:
-    time.sleep(60)
+import threading
+threading.Thread(target=loop_principal, daemon=True).start()
+bot.infinity_polling()
