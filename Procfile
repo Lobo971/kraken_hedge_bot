@@ -1,1 +1,1 @@
-worker: python main_bot_hedge_final_v3.py
+worker: python main_bot_hedge_final_v5.py
