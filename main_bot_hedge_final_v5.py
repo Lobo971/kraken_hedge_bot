@@ -2,9 +2,10 @@ import krakenex
 import time
 import requests
 from datetime import datetime
-from telebot import TeleBot
+from telebot import TeleBot, types
 import pandas as pd
 import os
+import threading
 
 # ==============================
 # CONFIGURAÇÕES TELEGRAM
@@ -28,13 +29,13 @@ def enviar_telegram(msg):
 api = krakenex.API()
 api.load_key('kraken.key')  # Arquivo com suas chaves da Kraken
 
-SALDO_MINIMO = 10.0  # Saldo mínimo para operar
+SALDO_MINIMO = 10.0
 BOT_LIGADO_ENVIADO = False
 COINS = ["XXBTZEUR", "XETHZEUR"]
 STOP_LOSS_PERCENT = 1.0
 TAKE_PROFIT_PERCENT = 1.5
-MAX_RISCO_POR_TRADE = 0.3  # % do saldo disponível por operação
-PERIODO_MA = 5  # Média móvel simples
+MAX_RISCO_POR_TRADE = 0.3
+PERIODO_MA = 5
 
 # ==============================
 # Histórico de preços e trades
@@ -46,7 +47,7 @@ if not os.path.exists(arquivo_trades):
     df.to_csv(arquivo_trades, index=False)
 
 # ==============================
-# FUNÇÕES
+# FUNÇÕES DE TRADING
 # ==============================
 def verificar_saldo():
     try:
@@ -137,12 +138,33 @@ def executar_estrategia():
             enviar_telegram(f"📊 {coin} sem sinal claro ({delta_percentual:.2f}%), nada a fazer.")
 
 # ==============================
-# LOOP PRINCIPAL
+# COMANDOS TELEGRAM
 # ==============================
-if __name__ == "__main__":
+@bot.message_handler(commands=['start'])
+def start_command(message):
+    bot.send_message(message.chat.id, "✅ BOT ULTRAPROFESSIONAL LIGADO!\nUse /saldo para ver seu saldo atual.")
+
+@bot.message_handler(commands=['saldo'])
+def saldo_command(message):
+    saldo_atual = verificar_saldo()
+    bot.send_message(message.chat.id, f"💰 Saldo atual: {saldo_atual:.2f}€")
+
+# ==============================
+# THREAD PARA TRADING
+# ==============================
+def bot_trading_loop():
     while True:
         try:
             executar_estrategia()
         except Exception as e:
             enviar_telegram(f"❌ Erro inesperado: {e}")
         time.sleep(60)
+
+# ==============================
+# INICIAR BOT
+# ==============================
+if __name__ == "__main__":
+    # Inicia a thread do loop de trading
+    threading.Thread(target=bot_trading_loop, daemon=True).start()
+    # Inicia o polling do Telegram (responde a comandos)
+    bot.infinity_polling()
