@@ -1,3 +1,4 @@
 krakenex
+pandas
 requests
-pyTelegramBotAPI
+python-dotenv
